@@ -16,6 +16,12 @@ import {
   webDeleteRule,
   webChatPicture,
 } from "./forward.mjs";
+import {
+  applyWebGroupAction,
+  getWebGroupDetails,
+  getWebGroupInvite,
+  setWebGroupSetting,
+} from "./handlers/groups-handler.mjs";
 
 // ─── مصادقة ────────────────────────────────────────────────────────
 function authUid(req) {
@@ -78,6 +84,34 @@ export function registerWebApp(app) {
 
   app.post("/api/fw/groups/send", parseJson, guard(async (uid, req) => {
     return await webSendGroupMessage(uid, req.body?.id, req.body?.text, req.body?.phoneNumber);
+  }));
+
+  app.post("/api/fw/groups/detail", parseJson, guard(async (uid, req) => {
+    return await getWebGroupDetails(uid, req.body?.id, req.body?.phoneNumber);
+  }));
+
+  app.post("/api/fw/groups/invite", parseJson, guard(async (uid, req) => {
+    return await getWebGroupInvite(uid, req.body?.id, req.body?.phoneNumber);
+  }));
+
+  app.post("/api/fw/groups/settings", parseJson, guard(async (uid, req) => {
+    return await setWebGroupSetting(
+      uid,
+      req.body?.id,
+      req.body?.phoneNumber,
+      req.body?.setting,
+      req.body?.enabled,
+    );
+  }));
+
+  app.post("/api/fw/groups/action", parseJson, guard(async (uid, req) => {
+    return await applyWebGroupAction(
+      uid,
+      req.body?.id,
+      req.body?.phoneNumber,
+      req.body?.action,
+      req.body?.value,
+    );
   }));
 
   app.post("/api/fw/rule/create", parseJson, guard(async (uid, req) => {
@@ -196,6 +230,14 @@ body{padding-bottom:88px;font-size:15px;line-height:1.5}
 .sechead{display:flex;align-items:center;justify-content:space-between;margin:2px 0 12px;gap:10px}
 .sechead .t{font-size:13.5px;font-weight:800;color:var(--mut)}
 .cnt{display:inline-flex;align-items:center;gap:4px;background:var(--card2);border:1px solid var(--line);border-radius:20px;padding:2px 10px;font-size:11.5px;color:var(--mut);font-weight:700;flex-shrink:0}
+.group-card{cursor:pointer}
+.group-detail-block{background:var(--card2);border:1px solid var(--line);border-radius:14px;padding:13px;margin:0 0 12px}
+.group-detail-title{font-size:13px;font-weight:800;margin-bottom:8px}
+.group-detail-line{font-size:13px;color:var(--mut);line-height:1.8;overflow-wrap:anywhere}
+.group-option{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 0;border-top:1px solid var(--line)}
+.group-member-list{max-height:230px;overflow:auto}
+.group-member{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid var(--line);font-size:13px}
+.group-invite-value{font-size:12px;color:var(--mut);overflow-wrap:anywhere;line-height:1.7;margin-top:8px}
 </style>
 </head>
 <body>
@@ -424,18 +466,24 @@ function renderGroups(v){
     html += '<div class="empty"><div class="big">👥</div>لا توجد مجموعات' + (Q?' مطابقة للبحث':'') + '<br>اضغط "تحديث من واتساب" لجلب مجموعاتك</div>';
   } else {
     html += items.map(g =>
-      '<div class="card"><div class="row">' +
+      '<div class="card group-card" data-group-open="'+esc(g.id)+'" role="button" tabindex="0" aria-label="خيارات المجموعة '+esc(g.name)+'"><div class="row">' +
       '<div class="avatar" data-jid="'+esc(g.id)+'">👥</div>' +
       '<div class="grow"><div class="nm">' + esc(g.name) + '</div>' +
       '<div class="meta">👥 ' + (g.members ? g.members + ' عضو' : 'مجموعة واتساب') + '</div></div>' +
       (g.members ? '<span class="cnt">' + g.members + '</span>' : '') +
-      '<button class="btn btn-p btn-sm" data-group-send="'+esc(g.id)+'">📨 إرسال</button>' +
+      '<span class="btn btn-p btn-sm">⚙️ الخيارات</span>' +
       '</div></div>'
     ).join("");
   }
   v.innerHTML = html;
-  v.querySelectorAll("[data-group-send]").forEach(button=>{
-    button.addEventListener("click", ()=>openGroupMessageSheet(button.dataset.groupSend));
+  v.querySelectorAll("[data-group-open]").forEach(card=>{
+    card.addEventListener("click", ()=>openGroupDetails(card.dataset.groupOpen));
+    card.addEventListener("keydown", event=>{
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        openGroupDetails(card.dataset.groupOpen);
+      }
+    });
   });
   lazyPics();
 }
@@ -445,6 +493,165 @@ async function refreshGroups(btn){
   try { await api("/api/fw/groups/refresh", {}); toast("✅ تم تحديث المجموعات"); await load(); }
   catch(e){ toast("❌ "+e.message); }
   btn.disabled = false; btn.innerHTML = "🔄 تحديث من واتساب";
+}
+
+let GROUP_DETAIL = null;
+async function openGroupDetails(groupId){
+  const group = ST.groups.find(item=>item.id===groupId);
+  if (!group) return toast("❌ المجموعة غير موجودة في قائمتك");
+  GROUP_DETAIL = { ...group };
+  const sh = document.getElementById("sheet");
+  sh.innerHTML = '<div class="grip"></div><div class="empty"><span class="spin"></span><br>جارٍ جلب تفاصيل المجموعة…</div>';
+  document.getElementById("sheetBg").classList.add("open");
+  sh.classList.add("open");
+  try {
+    const detail = await api("/api/fw/groups/detail", {
+      id: group.id,
+      phoneNumber: group.phoneNumber || ""
+    });
+    GROUP_DETAIL = { ...group, ...detail };
+    renderGroupDetails();
+  } catch(e) {
+    sh.innerHTML = '<div class="grip"></div><h2>⚠️ تعذّر فتح المجموعة</h2><div class="meta" style="white-space:normal">'+esc(e.message)+'</div><button class="btn btn-s" style="margin-top:16px" onclick="closeSheet()">إغلاق</button>';
+  }
+}
+
+function renderGroupDetails(){
+  if (!GROUP_DETAIL) return;
+  const detail = GROUP_DETAIL;
+  const sh = document.getElementById("sheet");
+  const canManage = detail.isAdmin === true;
+  const created = detail.createdAt ? new Date(detail.createdAt).toLocaleDateString("ar") : "غير متاح";
+  const members = Array.isArray(detail.members) ? detail.members : [];
+  const memberRows = members.length
+    ? members.map(member =>
+        '<div class="group-member"><span>'+esc(member.label)+'</span><span class="meta">'+esc(member.role)+'</span></div>'
+      ).join("")
+    : '<div class="meta" style="white-space:normal">لا تتوفر بيانات الأعضاء حالياً.</div>';
+  const settingRow = (key, label, enabled) =>
+    '<div class="group-option"><div><div class="nm">'+label+'</div><div class="meta">'+(enabled?"مفعّل":"متوقف")+'</div></div>' +
+    '<button class="btn '+(enabled?"btn-p":"btn-s")+'" data-group-setting="'+key+'" '+(canManage?"":"disabled")+'>'+(enabled?"إيقاف":"تفعيل")+'</button></div>';
+
+  sh.innerHTML =
+    '<div class="grip"></div>' +
+    '<h2>👥 '+esc(detail.name||detail.id)+'</h2>' +
+    '<div class="group-detail-block"><div class="group-detail-title">تفاصيل المجموعة</div>' +
+    '<div class="group-detail-line">الأعضاء: '+Number(detail.memberCount||0).toLocaleString("ar")+
+    ' · المشرفون: '+Number(detail.adminCount||0).toLocaleString("ar")+'</div>' +
+    '<div class="group-detail-line">تاريخ الإنشاء: '+created+'</div>' +
+    '<div class="group-detail-line">إرسال الأعضاء: '+(detail.locked?"للمشرفين فقط":"مفتوح للأعضاء")+'</div>' +
+    '<div class="group-detail-line">الوصف: '+esc(detail.description||"لا يوجد وصف")+'</div></div>' +
+    '<div class="group-detail-block"><div class="group-detail-title">الأعضاء ('+members.length+(detail.membersTruncated?"+":"")+')</div>' +
+    '<div class="group-member-list">'+memberRows+'</div>' +
+    (detail.membersTruncated?'<div class="meta" style="white-space:normal">تُعرض أول 500 عضوية فقط.</div>':"")+'</div>' +
+    '<div class="group-detail-block"><div class="group-detail-title">إعدادات الروابط</div>' +
+    settingRow("antiLink","حذف الرسائل التي تحتوي روابط",detail.antiLinkEnabled) +
+    settingRow("inspectInvite","فحص روابط دعوة واتساب",detail.inspectInviteEnabled) +
+    '<div class="meta" style="white-space:normal;margin-top:8px">'+
+    (canManage?"حذف الروابط يتطلب أن يكون رقم واتساب مشرفاً وله صلاحية حذف الرسائل.":"تفعيل إعدادات الحماية متاح عندما يكون رقم واتساب مشرفاً.")+
+    '</div></div>' +
+    '<div class="group-detail-block"><div class="group-detail-title">إدارة المجموعة</div>' +
+    '<div style="display:flex;gap:8px;flex-wrap:wrap">' +
+    '<button class="btn btn-s btn-sm" data-group-action="rename" '+(canManage?"":"disabled")+'>تغيير الاسم</button>' +
+    '<button class="btn btn-s btn-sm" data-group-action="description" '+(canManage?"":"disabled")+'>تغيير الوصف</button>' +
+    '<button class="btn btn-s btn-sm" data-group-action="'+(detail.locked?"unlock":"lock")+'" '+(canManage?"":"disabled")+'>'+
+    (detail.locked?"فتح الإرسال للأعضاء":"قصر الإرسال على المشرفين")+'</button></div>' +
+    '<div class="meta" style="white-space:normal;margin-top:8px">تتطلب هذه التعديلات صلاحية المشرف وتأكيداً قبل التنفيذ.</div></div>' +
+    '<div class="group-detail-block"><div class="group-detail-title">رابط الدعوة</div>' +
+    '<button class="btn btn-s btn-sm" data-group-invite '+(canManage?"":"disabled")+'>عرض رابط الدعوة</button>' +
+    '<button class="btn btn-s btn-sm" data-copy-group-invite '+(detail.inviteLink?"":"disabled")+'>نسخ</button>' +
+    '<div class="group-invite-value" id="groupInviteValue">'+esc(detail.inviteLink||"لا يظهر الرابط إلا بعد طلبه.")+'</div></div>' +
+    '<div style="display:flex;gap:8px;margin-top:6px">' +
+    '<button class="btn btn-p" style="flex:1" data-group-message>📨 إرسال رسالة واحدة</button>' +
+    '<button class="btn btn-s" onclick="closeSheet()">إغلاق</button></div>';
+
+  sh.querySelectorAll("[data-group-setting]").forEach(button=>{
+    button.addEventListener("click", ()=>toggleGroupSetting(button.dataset.groupSetting));
+  });
+  sh.querySelectorAll("[data-group-action]").forEach(button=>{
+    button.addEventListener("click", ()=>runGroupAdminAction(button.dataset.groupAction));
+  });
+  sh.querySelector("[data-group-invite]")?.addEventListener("click", showGroupInvite);
+  sh.querySelector("[data-copy-group-invite]")?.addEventListener("click", copyGroupInvite);
+  sh.querySelector("[data-group-message]")?.addEventListener("click", ()=>openGroupMessageSheet(detail.id));
+}
+
+async function toggleGroupSetting(setting){
+  if (!GROUP_DETAIL) return;
+  const current = setting === "antiLink" ? GROUP_DETAIL.antiLinkEnabled : GROUP_DETAIL.inspectInviteEnabled;
+  try {
+    const result = await api("/api/fw/groups/settings", {
+      id: GROUP_DETAIL.id,
+      phoneNumber: GROUP_DETAIL.phoneNumber || "",
+      setting,
+      enabled: !current
+    });
+    GROUP_DETAIL = { ...GROUP_DETAIL, ...result };
+    renderGroupDetails();
+    toast("✅ تم تحديث إعداد المجموعة");
+  } catch(e) {
+    toast("❌ " + e.message);
+  }
+}
+
+async function runGroupAdminAction(action){
+  if (!GROUP_DETAIL) return;
+  let value = "";
+  if (action === "rename") {
+    value = window.prompt("اكتب الاسم الجديد (حتى 25 حرفاً):", GROUP_DETAIL.name||"");
+    if (value === null) return;
+  } else if (action === "description") {
+    value = window.prompt("اكتب وصف المجموعة الجديد:", GROUP_DETAIL.description||"");
+    if (value === null) return;
+  } else {
+    const promptText = action === "lock"
+      ? "سيتم قصر إرسال الرسائل على المشرفين. هل تريد المتابعة؟"
+      : "سيُسمح لجميع الأعضاء بإرسال الرسائل. هل تريد المتابعة؟";
+    if (!confirm(promptText)) return;
+  }
+  try {
+    await api("/api/fw/groups/action", {
+      id: GROUP_DETAIL.id,
+      phoneNumber: GROUP_DETAIL.phoneNumber || "",
+      action,
+      value
+    });
+    toast("✅ تم تحديث إعداد المجموعة");
+    await openGroupDetails(GROUP_DETAIL.id);
+  } catch(e) {
+    toast("❌ " + e.message);
+  }
+}
+
+async function showGroupInvite(){
+  if (!GROUP_DETAIL) return;
+  const button = document.querySelector("[data-group-invite]");
+  if (button) { button.disabled = true; button.textContent = "جارٍ جلب الرابط…"; }
+  try {
+    const result = await api("/api/fw/groups/invite", {
+      id: GROUP_DETAIL.id,
+      phoneNumber: GROUP_DETAIL.phoneNumber || ""
+    });
+    GROUP_DETAIL.inviteLink = result.link;
+    const value = document.getElementById("groupInviteValue");
+    if (value) value.textContent = result.link;
+    const copyButton = document.querySelector("[data-copy-group-invite]");
+    if (copyButton) copyButton.disabled = false;
+  } catch(e) {
+    toast("❌ " + e.message);
+  } finally {
+    if (button) { button.disabled = false; button.textContent = "عرض رابط الدعوة"; }
+  }
+}
+
+async function copyGroupInvite(){
+  if (!GROUP_DETAIL?.inviteLink || !navigator.clipboard?.writeText) return toast("تعذّر نسخ الرابط من هذا المتصفح");
+  try {
+    await navigator.clipboard.writeText(GROUP_DETAIL.inviteLink);
+    toast("✅ تم نسخ رابط الدعوة");
+  } catch(e) {
+    toast("تعذّر نسخ الرابط من هذا المتصفح");
+  }
 }
 
 let GROUP_MESSAGE = null;

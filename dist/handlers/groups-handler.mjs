@@ -53,8 +53,19 @@ function findSocket(userId) {
   return findSockets(userId)[0] || null;
 }
 
-async function findSocketForGroup(userId, groupId) {
+function socketMatchesPhone(sock, phoneNumber) {
+  const wanted = String(phoneNumber || "").replace(/\D/g, "");
+  if (!wanted) return true;
+  const actual = [sock?.user?.id, sock?.user?.jid, sock?.user?.pn]
+    .filter(Boolean)
+    .map((value) => String(value).split(":")[0].split("@")[0].replace(/\D/g, ""))
+    .filter(Boolean);
+  return actual.includes(wanted);
+}
+
+async function findSocketForGroup(userId, groupId, phoneNumber = null) {
   for (const sock of findSockets(userId)) {
+    if (!socketMatchesPhone(sock, phoneNumber)) continue;
     if (typeof sock.groupMetadata !== "function") continue;
     try {
       const metadata = await sock.groupMetadata(groupId);
@@ -240,6 +251,138 @@ function ensureModerationListener(userId, sock = findSocket(userId)) {
   };
   sock.ev.on("messages.upsert", listener);
   _listeners.add(sock);
+}
+
+function maskedGroupMember(participant) {
+  const raw = participant?.id || participant?.jid || participant?.phoneNumber || "";
+  const digits = String(raw).split(":")[0].split("@")[0].replace(/\D/g, "");
+  const role = participant?.admin === "superadmin"
+    ? "المؤسس"
+    : participant?.admin === "admin" || participant?.isAdmin === true
+      ? "مشرف"
+      : "عضو";
+  return {
+    label: digits ? `••••${digits.slice(-4)}` : "عضو",
+    role,
+  };
+}
+
+export async function getWebGroupDetails(userId, groupId, phoneNumber) {
+  userId = String(userId);
+  groupId = String(groupId || "").trim();
+  if (!groupId.endsWith("@g.us")) throw new Error("معرّف المجموعة غير صالح");
+  if (!phoneNumber) throw new Error("حدّث قائمة المجموعات واختر رقم واتساب");
+
+  const sock = await findSocketForGroup(userId, groupId, phoneNumber);
+  if (!sock) throw new Error("هذه المجموعة غير متاحة على رقم واتساب المختار");
+  const metadata = await sock.groupMetadata(groupId);
+  if (!metadata || (metadata.id && metadata.id !== groupId)) {
+    throw new Error("تعذّر جلب تفاصيل هذه المجموعة");
+  }
+
+  const participants = Array.isArray(metadata.participants) ? metadata.participants : [];
+  const user = _deps?.getUser?.(userId) || {};
+  const creation = Number(metadata.creation);
+  const createdAt = Number.isFinite(creation) && creation > 0
+    ? new Date(creation < 1e12 ? creation * 1000 : creation).toISOString()
+    : null;
+
+  return {
+    id: groupId,
+    name: String(metadata.subject || metadata.name || groupId),
+    description: String(metadata.desc || ""),
+    memberCount: Number(metadata.size) || participants.length,
+    adminCount: participants.filter((participant) =>
+      participant?.admin === "admin" || participant?.admin === "superadmin" || participant?.isAdmin === true
+    ).length,
+    createdAt,
+    isAdmin: ownAccountIsAdmin(sock, metadata) === true,
+    locked: metadata.announce === true,
+    members: participants.slice(0, 500).map(maskedGroupMember),
+    membersTruncated: participants.length > 500,
+    antiLinkEnabled: (user.antiLinkGroups || []).includes(groupId),
+    inspectInviteEnabled: (user.inspectInviteGroups || []).includes(groupId),
+  };
+}
+
+export async function getWebGroupInvite(userId, groupId, phoneNumber) {
+  userId = String(userId);
+  groupId = String(groupId || "").trim();
+  if (!groupId.endsWith("@g.us")) throw new Error("معرّف المجموعة غير صالح");
+  const sock = await findSocketForGroup(userId, groupId, phoneNumber);
+  if (!sock) throw new Error("هذه المجموعة غير متاحة على رقم واتساب المختار");
+  const metadata = await sock.groupMetadata(groupId);
+  if (ownAccountIsAdmin(sock, metadata) !== true) {
+    throw new Error("رابط الدعوة متاح فقط عندما يكون رقم واتساب مشرفاً");
+  }
+  const code = await sock.groupInviteCode?.(groupId);
+  if (!code) throw new Error("تعذّر جلب رابط الدعوة");
+  return { link: `https://chat.whatsapp.com/${code}` };
+}
+
+export async function setWebGroupSetting(userId, groupId, phoneNumber, setting, enabled) {
+  userId = String(userId);
+  groupId = String(groupId || "").trim();
+  if (!groupId.endsWith("@g.us")) throw new Error("معرّف المجموعة غير صالح");
+  if (!["antiLink", "inspectInvite"].includes(setting)) throw new Error("إعداد المجموعة غير صالح");
+  if (typeof enabled !== "boolean") throw new Error("حالة الإعداد غير صالحة");
+
+  const sock = await findSocketForGroup(userId, groupId, phoneNumber);
+  if (!sock) throw new Error("هذه المجموعة غير متاحة على رقم واتساب المختار");
+  const metadata = await sock.groupMetadata(groupId);
+  if (ownAccountIsAdmin(sock, metadata) !== true) {
+    throw new Error("يجب أن يكون رقم واتساب مشرفاً لتغيير إعدادات حماية المجموعة");
+  }
+
+  const user = _deps?.getUser?.(userId);
+  if (!user || typeof _deps?.saveUser !== "function") {
+    throw new Error("تعذّر الوصول إلى إعدادات المستخدم");
+  }
+  const key = setting === "antiLink" ? "antiLinkGroups" : "inspectInviteGroups";
+  const current = Array.isArray(user[key]) ? user[key] : [];
+  const updated = enabled
+    ? (current.includes(groupId) ? current : [...current, groupId])
+    : current.filter((id) => id !== groupId);
+  _deps.saveUser(userId, { [key]: updated });
+  ensureModerationListener(userId, sock);
+
+  return {
+    antiLinkEnabled: setting === "antiLink" ? enabled : updated.includes(groupId),
+    inspectInviteEnabled: setting === "inspectInvite" ? enabled : (user.inspectInviteGroups || []).includes(groupId),
+  };
+}
+
+export async function applyWebGroupAction(userId, groupId, phoneNumber, action, value) {
+  userId = String(userId);
+  groupId = String(groupId || "").trim();
+  if (!groupId.endsWith("@g.us")) throw new Error("معرّف المجموعة غير صالح");
+  if (!["rename", "description", "lock", "unlock"].includes(action)) {
+    throw new Error("إجراء المجموعة غير صالح");
+  }
+
+  const sock = await findSocketForGroup(userId, groupId, phoneNumber);
+  if (!sock) throw new Error("هذه المجموعة غير متاحة على رقم واتساب المختار");
+  const metadata = await sock.groupMetadata(groupId);
+  if (ownAccountIsAdmin(sock, metadata) !== true) {
+    throw new Error("يجب أن يكون رقم واتساب مشرفاً لتعديل المجموعة");
+  }
+
+  if (action === "rename") {
+    const subject = String(value || "").trim();
+    if (!subject || subject.length > 25) throw new Error("اسم المجموعة مطلوب وبحد أقصى 25 حرفاً");
+    if (typeof sock.groupUpdateSubject !== "function") throw new Error("تغيير اسم المجموعة غير متاح حالياً");
+    await sock.groupUpdateSubject(groupId, subject);
+  } else if (action === "description") {
+    const description = String(value || "").trim();
+    if (description.length > 512) throw new Error("الوصف يتجاوز الحد المسموح");
+    if (typeof sock.groupUpdateDescription !== "function") throw new Error("تغيير وصف المجموعة غير متاح حالياً");
+    await sock.groupUpdateDescription(groupId, description);
+  } else {
+    if (typeof sock.groupSettingUpdate !== "function") throw new Error("تغيير صلاحية الإرسال غير متاح حالياً");
+    await sock.groupSettingUpdate(groupId, action === "lock" ? "announcement" : "not_announcement");
+  }
+
+  return { ok: true };
 }
 
 function attachConfiguredListeners(userId) {

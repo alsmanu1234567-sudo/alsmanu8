@@ -5,8 +5,12 @@ import {
   extractWhatsAppGroupInviteCode,
   formatGroupInviteReport,
   hasAnyUrl,
+  applyWebGroupAction,
+  getWebGroupDetails,
+  getWebGroupInvite,
   handleCallback,
   handleText,
+  setWebGroupSetting,
   setDeps,
   stopModerationListenerRecovery
 } from "../../dist/handlers/groups-handler.mjs";
@@ -93,6 +97,65 @@ test("group message uses the connected socket that belongs to the selected group
 
   assert.deepEqual(sent, [{ jid: groupId, payload: { text: "رسالة تجريبية" } }]);
   assert.equal(state, null);
+  stopModerationListenerRecovery();
+});
+
+test("web group details mask member numbers and allow admin-only link controls", async () => {
+  const groupId = "120363123456789012@g.us";
+  const user = { antiLinkGroups: [], inspectInviteGroups: [] };
+  const adminActions = [];
+  const sock = {
+    user: { id: "249960506662:1@s.whatsapp.net" },
+    sendMessage: async () => {},
+    groupMetadata: async (jid) => ({
+      id: jid,
+      subject: "اختبار",
+      desc: "وصف المجموعة",
+      creation: 1700000000,
+      announce: true,
+      participants: [
+        { id: "249960506662@s.whatsapp.net", admin: "admin" },
+        { id: "249123456789@s.whatsapp.net" }
+      ]
+    }),
+    groupInviteCode: async () => "InviteCode123456",
+    groupUpdateSubject: async (_jid, subject) => adminActions.push(["rename", subject]),
+    groupUpdateDescription: async (_jid, description) => adminActions.push(["description", description]),
+    groupSettingUpdate: async (_jid, setting) => adminActions.push(["setting", setting])
+  };
+  setDeps({
+    inMemoryDB: { sessions: new Map([["123", sock]]), users: new Map([["123", user]]) },
+    getUser: () => user,
+    saveUser: (_id, patch) => Object.assign(user, patch)
+  });
+
+  const detail = await getWebGroupDetails("123", groupId, "+249960506662");
+  assert.equal(detail.name, "اختبار");
+  assert.equal(detail.memberCount, 2);
+  assert.equal(detail.adminCount, 1);
+  assert.equal(detail.isAdmin, true);
+  assert.equal(detail.locked, true);
+  assert.equal(detail.members[0].label, "••••6662");
+  assert.equal(JSON.stringify(detail).includes("249960506662"), false);
+  await assert.rejects(getWebGroupDetails("123", groupId, "+249111111111"), /غير متاحة/);
+
+  const invite = await getWebGroupInvite("123", groupId, "+249960506662");
+  assert.equal(invite.link, "https://chat.whatsapp.com/InviteCode123456");
+  const antiLink = await setWebGroupSetting("123", groupId, "+249960506662", "antiLink", true);
+  assert.equal(antiLink.antiLinkEnabled, true);
+  assert.deepEqual(user.antiLinkGroups, [groupId]);
+  const inspectInvite = await setWebGroupSetting("123", groupId, "+249960506662", "inspectInvite", true);
+  assert.equal(inspectInvite.inspectInviteEnabled, true);
+  assert.deepEqual(user.inspectInviteGroups, [groupId]);
+  await applyWebGroupAction("123", groupId, "+249960506662", "rename", "اسم جديد");
+  await applyWebGroupAction("123", groupId, "+249960506662", "description", "وصف جديد");
+  await applyWebGroupAction("123", groupId, "+249960506662", "unlock");
+  assert.deepEqual(adminActions, [
+    ["rename", "اسم جديد"],
+    ["description", "وصف جديد"],
+    ["setting", "not_announcement"]
+  ]);
+  await assert.rejects(applyWebGroupAction("123", groupId, "+249960506662", "rename", "x".repeat(26)), /25/);
   stopModerationListenerRecovery();
 });
 

@@ -299450,13 +299450,12 @@ async function handleGroupsV2(bot2, chatId, userId, data) {
   const isDev2 = userId === DEVELOPER_ID;
  if (data === "menu_groups") {
   const cachedGroups = inMemoryDB.groupsCache.get(userId) || [];
-  await renderGroupsView(
-  bot2,
-  chatId,
-  userId,
-  `*إدارة المجموعات*\n\nالمجموعات المحفوظة: *${cachedGroups.length}*\n${sock ? "واتساب متصل. اختر عرض المجموعات أو حدّثها." : "افتح القسم الآن، ثم اربط واتساب أو أعد ربطه لتحديث القائمة."}`,
-  groupsMenuKeyboardV2()
+  const sent = await bot2.sendMessage(
+    chatId,
+    `*إدارة المجموعات*\n\nالمجموعات المحفوظة: *${cachedGroups.length}*\n${sock ? "واتساب متصل. اختر عرض المجموعات أو حدّثها." : "افتح القسم الآن، ثم اربط واتساب أو أعد ربطه لتحديث القائمة."}`,
+    { parse_mode: "Markdown", reply_markup: groupsMenuKeyboardV2() }
   );
+  if (sent?.message_id) groupsViewMessages.set(userId, sent.message_id);
   return;
   }
   if (data === "grpv2_refresh") {
