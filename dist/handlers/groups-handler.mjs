@@ -1,0 +1,521 @@
+// dist/handlers/groups-handler.mjs
+// Domain: Groups — /groups + callbacks
+import { webappUrlFor } from "../webapp-auth.mjs";
+
+export const pluginManifest = {
+  name: 'groups',
+  version: '1.0.0',
+  type: 'handler',
+  description: 'إدارة المجموعات: /groups + callbacks',
+  textOrder: 6,
+  cbOrder: 5,
+  enabled: true,
+};
+
+let _deps = null;
+const _listeners = new WeakSet();
+const _warningTimes = new Map();
+const _inviteCache = new Map();
+let _listenerRecoveryTimer = null;
+
+export function setDeps(d) {
+  _deps = { ...(_deps || {}), ...d };
+  if (!_listenerRecoveryTimer) {
+    _listenerRecoveryTimer = setInterval(recoverGroupListeners, 10_000);
+    _listenerRecoveryTimer.unref?.();
+    recoverGroupListeners();
+  }
+}
+
+function findSockets(userId) {
+  const sessions = _deps?.inMemoryDB?.sessions;
+  if (!sessions) return [];
+  const sockets = [];
+  const add = (value) => {
+    const sock = value?.sock || value;
+    if (sock?.sendMessage && !sockets.includes(sock)) sockets.push(sock);
+  };
+  add(sessions.get(String(userId)));
+  add(sessions.get(`sess_${userId}`));
+  for (const [key, value] of sessions.entries()) {
+    const sessionKey = String(key);
+    if (
+      sessionKey === String(userId) ||
+      sessionKey === `sess_${userId}` ||
+      sessionKey.startsWith(`${userId}_`) ||
+      sessionKey.startsWith(`sess_${userId}_`)
+    ) add(value);
+  }
+  return sockets;
+}
+
+function findSocket(userId) {
+  return findSockets(userId)[0] || null;
+}
+
+async function findSocketForGroup(userId, groupId) {
+  for (const sock of findSockets(userId)) {
+    if (typeof sock.groupMetadata !== "function") continue;
+    try {
+      const metadata = await sock.groupMetadata(groupId);
+      if (metadata?.id === groupId || Array.isArray(metadata?.participants)) return sock;
+    } catch {}
+  }
+  return null;
+}
+
+function getGroupMessageText(message) {
+  let content = message?.message || {};
+  for (let i = 0; i < 4; i++) {
+    const wrapped = content.ephemeralMessage?.message || content.viewOnceMessage?.message ||
+      content.viewOnceMessageV2?.message || content.documentWithCaptionMessage?.message;
+    if (!wrapped) break;
+    content = wrapped;
+  }
+  return [
+    content.conversation,
+    content.extendedTextMessage?.text,
+    content.imageMessage?.caption,
+    content.videoMessage?.caption,
+    content.documentMessage?.caption,
+    content.buttonsResponseMessage?.selectedDisplayText,
+    content.listResponseMessage?.title
+  ].filter(Boolean).join("\n");
+}
+
+export function hasAnyUrl(text) {
+  return /(?:https?:\/\/|www\.)\S+|(?:^|\s)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}(?::\d+)?(?:[/?#]\S*)?|\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?(?:[/?#]\S*)?/iu.test(String(text || ""));
+}
+
+export function extractWhatsAppGroupInviteCode(text) {
+  return String(text || "").match(/\b(?:https?:\/\/)?(?:www\.)?chat\.whatsapp\.com\/([A-Za-z0-9_-]{8,})/i)?.[1] || null;
+}
+
+export function formatGroupInviteReport(metadata = {}) {
+  const participants = Array.isArray(metadata.participants) ? metadata.participants : null;
+  const memberCount = metadata.size != null && metadata.size !== "" && Number.isFinite(Number(metadata.size))
+    ? Number(metadata.size) : participants?.length;
+  const adminCount = participants
+    ? participants.filter((p) => p?.admin === "admin" || p?.admin === "superadmin" || p?.isAdmin === true).length
+    : null;
+  const createdAt = Number(metadata.creation);
+  const createdText = Number.isFinite(createdAt) && createdAt > 0
+    ? new Date(createdAt < 1e12 ? createdAt * 1000 : createdAt).toLocaleDateString("ar")
+    : "غير متاح من معاينة الرابط";
+  return [
+    "🔎 معلومات متاحة من معاينة رابط مجموعة واتساب",
+    `👥 الاسم: ${metadata.subject || metadata.name || "غير متاح"}`,
+    `👤 الأعضاء: ${memberCount ?? "غير متاح من معاينة الرابط"}`,
+    `🛡️ المشرفون: ${adminCount ?? "غير متاح من معاينة الرابط"}`,
+    `📝 الوصف: ${metadata.desc || "غير متاح من معاينة الرابط"}`,
+    `📅 تاريخ الإنشاء: ${createdText}`,
+    "ℹ️ لم ينضم البوت إلى المجموعة؛ التفاصيل التي لا تعرضها واتساب في المعاينة تبقى غير متاحة."
+  ].join("\n");
+}
+
+function messageHasLink(text) {
+  return hasAnyUrl(text);
+}
+
+function asciiDigits(value) {
+  return String(value).replace(/[٠-٩]/g, (digit) => String(digit.charCodeAt(0) - 0x0660))
+    .replace(/[۰-۹]/g, (digit) => String(digit.charCodeAt(0) - 0x06f0));
+}
+
+function ownAccountIsAdmin(sock, metadata) {
+  const ownValues = [sock?.user?.id, sock?.user?.jid, sock?.user?.lid, sock?.user?.pn]
+    .filter(Boolean).map((value) => String(value).split(":")[0].toLowerCase());
+  const ownDigits = ownValues.map((value) => value.split("@")[0].replace(/\D/g, "")).filter(Boolean);
+  const participants = metadata?.participants;
+  if (!ownValues.length || !Array.isArray(participants)) return null;
+  const matched = participants.find((participant) => {
+    const values = [participant?.id, participant?.jid, participant?.pn, participant?.phoneNumber, participant?.lid]
+      .filter(Boolean).map((value) => String(value).split(":")[0].toLowerCase());
+    const digits = values.map((value) => value.split("@")[0].replace(/\D/g, "")).filter(Boolean);
+    return values.some((value) => ownValues.includes(value)) || digits.some((value) => ownDigits.includes(value));
+  });
+  if (!matched) return null;
+  return matched.admin === "admin" || matched.admin === "superadmin" || matched.isAdmin === true;
+}
+
+async function fetchInvitePhoto(sock, groupJid) {
+  if (!groupJid || typeof sock?.profilePictureUrl !== "function") return null;
+  try {
+    const url = await sock.profilePictureUrl(groupJid, "image");
+    if (!url) return null;
+    const response = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+    if (!response.ok) return null;
+    const length = Number(response.headers.get("content-length") || 0);
+    if (length > 5 * 1024 * 1024) return null;
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of response.body || []) {
+      size += chunk.length;
+      if (size > 5 * 1024 * 1024) return null;
+      chunks.push(chunk);
+    }
+    return size > 0 ? Buffer.concat(chunks, size) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function inspectInviteLink(sock, groupJid, code) {
+  const now = Date.now();
+  let cached = _inviteCache.get(code);
+  if (!cached || cached.expiresAt <= now) {
+    if (typeof sock.groupGetInviteInfo !== "function") {
+      await sock.sendMessage(groupJid, { text: "تعذر فحص الرابط: مكتبة واتساب الحالية لا توفر معاينة معلومات الدعوة." });
+      return;
+    }
+    const metadata = await sock.groupGetInviteInfo(code);
+    cached = { metadata, expiresAt: now + 10 * 60_000 };
+    _inviteCache.set(code, cached);
+    if (_inviteCache.size > 200) _inviteCache.delete(_inviteCache.keys().next().value);
+  }
+  const metadata = cached.metadata || {};
+  const report = formatGroupInviteReport(metadata);
+  const picture = await fetchInvitePhoto(sock, metadata.id || metadata.jid);
+  if (picture) await sock.sendMessage(groupJid, { image: picture, caption: report });
+  else await sock.sendMessage(groupJid, { text: report });
+}
+
+async function handleModeratedMessage(userId, sock, message) {
+  const key = message?.key;
+  const groupJid = key?.remoteJid;
+  if (!groupJid?.endsWith("@g.us") || key.fromMe) return;
+  const text = getGroupMessageText(message);
+  if (!text) return;
+  const user = _deps.getUser(userId);
+  const antiLinkEnabled = (user.antiLinkGroups || []).includes(groupJid);
+  const inspectEnabled = (user.inspectInviteGroups || []).includes(groupJid);
+  if (!antiLinkEnabled && !inspectEnabled) return;
+
+  const inviteCode = extractWhatsAppGroupInviteCode(text);
+  if (inspectEnabled && inviteCode) {
+    try { await inspectInviteLink(sock, groupJid, inviteCode); } catch {
+      await sock.sendMessage(groupJid, { text: "تعذر جلب معاينة الرابط. قد يكون الرابط منتهياً أو غير صالح." }).catch(() => {});
+    }
+  }
+  if (!antiLinkEnabled || !messageHasLink(text)) return;
+
+  let admin = null;
+  try {
+    if (typeof sock.groupMetadata === "function") {
+      const metadata = await sock.groupMetadata(groupJid);
+      admin = ownAccountIsAdmin(sock, metadata);
+    }
+  } catch {}
+  if (admin !== true) {
+    const warningKey = `${userId}:${groupJid}`;
+    const lastWarning = _warningTimes.get(warningKey) || 0;
+    if (Date.now() - lastWarning < 60_000) return;
+    _warningTimes.set(warningKey, Date.now());
+    if (_warningTimes.size > 500) _warningTimes.delete(_warningTimes.keys().next().value);
+    await sock.sendMessage(groupJid, {
+      text: admin === false
+        ? "⚠️ تم تفعيل حذف الروابط، لكن رقم واتساب المرتبط غير مشرف في هذه المجموعة، لذلك لم تُحذف الرسالة. عيّنه مشرفاً مع صلاحية حذف الرسائل."
+        : "⚠️ تعذر التحقق من صلاحية المشرف الآن، لذلك لم تُحذف رسالة الرابط. تحقق من اتصال واتساب وصلاحية الرقم المرتبط."
+    }).catch(() => {});
+    return;
+  }
+  try {
+    await sock.sendMessage(groupJid, { delete: key });
+  } catch {
+    const warningKey = `${userId}:${groupJid}`;
+    const lastWarning = _warningTimes.get(warningKey) || 0;
+    if (Date.now() - lastWarning >= 60_000) {
+      _warningTimes.set(warningKey, Date.now());
+      await sock.sendMessage(groupJid, { text: "⚠️ تعذر حذف الرابط. تحقق من صلاحيات المشرف لحساب واتساب المرتبط." }).catch(() => {});
+    }
+  }
+}
+
+function ensureModerationListener(userId, sock = findSocket(userId)) {
+  if (!sock?.ev?.on || _listeners.has(sock)) return;
+  const listener = (event) => {
+    for (const message of event?.messages || []) {
+      void handleModeratedMessage(String(userId), sock, message).catch(() => {});
+    }
+  };
+  sock.ev.on("messages.upsert", listener);
+  _listeners.add(sock);
+}
+
+function attachConfiguredListeners(userId) {
+  const user = _deps?.getUser?.(String(userId));
+  if ((user?.antiLinkGroups?.length || user?.inspectInviteGroups?.length) && userId) {
+    ensureModerationListener(String(userId));
+  }
+}
+
+function recoverGroupListeners() {
+  const users = _deps?.inMemoryDB?.users;
+  if (!(users instanceof Map)) return;
+  for (const [userId, user] of users.entries()) {
+    if (user?.antiLinkGroups?.length || user?.inspectInviteGroups?.length) {
+      ensureModerationListener(String(userId));
+    }
+  }
+}
+
+export function stopModerationListenerRecovery() {
+  if (_listenerRecoveryTimer) clearInterval(_listenerRecoveryTimer);
+  _listenerRecoveryTimer = null;
+}
+
+function controlsKeyboard(userId, groupId) {
+  const user = _deps.getUser(userId);
+  const links = (user.antiLinkGroups || []).includes(groupId);
+  const inspect = (user.inspectInviteGroups || []).includes(groupId);
+  return {
+    inline_keyboard: [
+      [{ text: "📨 إرسال رسالة للمجموعة", callback_data: `grp_custom_send_${groupId}` }],
+      [{ text: "🔁 إرسال مكرر (حد أقصى 5)", callback_data: `grp_custom_repeat_${groupId}` }],
+      [{ text: `${links ? "🟢" : "⚪"} حذف الروابط: ${links ? "مفعّل" : "متوقف"}`, callback_data: `grp_custom_links_${groupId}` }],
+      [{ text: `${inspect ? "🟢" : "⚪"} فحص روابط الدعوة: ${inspect ? "مفعّل" : "متوقف"}`, callback_data: `grp_custom_inspect_${groupId}` }]
+    ]
+  };
+}
+
+function groupsWebAppMarkup(markup, chatId, userId) {
+  if (String(chatId) !== String(userId)) return markup;
+  const baseUrl = webappUrlFor(userId);
+  if (!baseUrl) return markup;
+  const url = `${baseUrl}${baseUrl.includes("?") ? "&" : "?"}section=groups`;
+  const rows = Array.isArray(markup?.inline_keyboard) ? markup.inline_keyboard.map((row) => [...row]) : [];
+  rows.push([{ text: "🌐 فتح واجهة المجموعات", web_app: { url } }]);
+  return { ...markup, inline_keyboard: rows };
+}
+
+async function sendGroupsWebApp(bot, chatId, userId) {
+  if (String(chatId) !== String(userId)) {
+    await bot.sendMessage(chatId, "افتح المحادثة الخاصة مع البوت واكتب /wep g لفتح واجهة المجموعات.");
+    return;
+  }
+  const baseUrl = webappUrlFor(userId);
+  if (!baseUrl) {
+    await bot.sendMessage(chatId, "رابط الواجهة غير جاهز حالياً. جرّب مرة أخرى بعد تشغيل رابط الموقع.");
+    return;
+  }
+  const url = `${baseUrl}${baseUrl.includes("?") ? "&" : "?"}section=groups`;
+  await bot.sendMessage(chatId, "افتح واجهة إدارة المجموعات:", {
+    reply_markup: {
+      inline_keyboard: [[{ text: "🌐 فتح واجهة المجموعات", web_app: { url } }]]
+    }
+  });
+}
+
+async function sendRepeatedGroupMessage(bot, chatId, sock, groupId, message, count) {
+  for (let i = 0; i < count; i++) {
+    try { await bot.sendChatAction?.(chatId, "typing"); } catch {}
+    await sock.sendMessage(groupId, { text: message });
+    if (i + 1 < count) await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+}
+
+export async function handleText(bot, msg) {
+  if (!msg.text) return false;
+  const text = msg.text;
+  const chatId = msg.chat.id;
+  const userId = String(msg.from?.id || "");
+  attachConfiguredListeners(userId);
+
+  if (/^\/(?:wep|web)(?:@\w+)?\s+g$/i.test(text.trim())) {
+    const pending = _deps.getState?.(userId);
+    if (["awaiting_custom_group_message", "awaiting_custom_group_repeat_message", "awaiting_custom_group_repeat_count"].includes(pending?.state)) {
+      _deps.clearState?.(userId);
+    }
+    await sendGroupsWebApp(bot, chatId, userId);
+    return true;
+  }
+
+  if (text === "إلغاء" || text === "/cancel") {
+    const state = _deps.getState?.(userId);
+    if (["awaiting_custom_group_message", "awaiting_custom_group_repeat_message", "awaiting_custom_group_repeat_count"].includes(state?.state)) {
+      _deps.clearState?.(userId);
+      await bot.sendMessage(chatId, "✅ تم الإلغاء.");
+      return true;
+    }
+  }
+
+  const state = _deps.getState?.(userId);
+  if (state?.state === "awaiting_custom_group_message") {
+    const groupId = String(state.data?.groupId || "");
+    const sock = await findSocketForGroup(userId, groupId);
+    if (!sock || !groupId.endsWith("@g.us")) {
+      _deps.clearState?.(userId);
+      await bot.sendMessage(chatId, "❌ تعذر الإرسال: لم أجد اتصال واتساب عضواً في هذه المجموعة.");
+      return true;
+    }
+    if (!text.trim() || text.length > 3500) {
+      await bot.sendMessage(chatId, "❌ أرسل رسالة غير فارغة وبحد أقصى 3500 حرف.");
+      return true;
+    }
+    try {
+      await sock.sendMessage(groupId, { text });
+      _deps.clearState?.(userId);
+      await bot.sendMessage(chatId, "✅ تم إرسال الرسالة إلى المجموعة.");
+    } catch (error) {
+      _deps.clearState?.(userId);
+      const reason = String(error?.message || "خطأ غير معروف").slice(0, 240);
+      await bot.sendMessage(chatId, `❌ فشل الإرسال: ${reason}`);
+    }
+    return true;
+  }
+
+  if (state?.state === "awaiting_custom_group_repeat_message") {
+    if (!text.trim() || text.length > 3500) {
+      await bot.sendMessage(chatId, "❌ أرسل رسالة غير فارغة وبحد أقصى 3500 حرف.");
+      return true;
+    }
+    const trailingCount = text.match(/^(.+?)\s+([1-5٠-٥۰-۵])$/u);
+    if (trailingCount) {
+      const groupId = String(state.data?.groupId || "");
+      const sock = await findSocketForGroup(userId, groupId);
+      if (!sock || !groupId.endsWith("@g.us")) {
+        _deps.clearState?.(userId);
+        await bot.sendMessage(chatId, "❌ تعذر الإرسال: لم أجد اتصال واتساب عضواً في هذه المجموعة.");
+        return true;
+      }
+      _deps.clearState?.(userId);
+      try {
+        await sendRepeatedGroupMessage(bot, chatId, sock, groupId, trailingCount[1].trim(), Number(asciiDigits(trailingCount[2])));
+        await bot.sendMessage(chatId, `✅ اكتمل الإرسال: ${trailingCount[2]} رسالة.`);
+      } catch {
+        await bot.sendMessage(chatId, "⚠️ توقف الإرسال عند أول خطأ من واتساب؛ لم أعد إرسال الرسالة تلقائياً.");
+      }
+      return true;
+    }
+    _deps.setState(userId, "awaiting_custom_group_repeat_count", {
+      ...(state.data || {}),
+      message: text
+    });
+    await bot.sendMessage(chatId, "كم مرة؟ أرسل رقماً من 1 إلى 5. ويمكنك بدلاً من ذلك كتابة الرسالة والعدد معاً، مثل: `هلا 5`.");
+    return true;
+  }
+
+  if (state?.state === "awaiting_custom_group_repeat_count") {
+    const count = Number(asciiDigits(text));
+    const groupId = String(state.data?.groupId || "");
+    const message = String(state.data?.message || "");
+    const sock = await findSocketForGroup(userId, groupId);
+    if (!Number.isInteger(count) || count < 1 || count > 5) {
+      await bot.sendMessage(chatId, "❌ العدد المسموح من 1 إلى 5 فقط.");
+      return true;
+    }
+    if (!sock || !groupId.endsWith("@g.us") || !message) {
+      _deps.clearState?.(userId);
+      await bot.sendMessage(chatId, "❌ تعذر الإرسال: لا يوجد اتصال واتساب مؤكد لهذه المجموعة أو بيانات الرسالة غير متاحة.");
+      return true;
+    }
+    _deps.clearState?.(userId);
+    try {
+      await sendRepeatedGroupMessage(bot, chatId, sock, groupId, message, count);
+      await bot.sendMessage(chatId, `✅ اكتمل الإرسال: ${count} رسالة. تم الإرسال بفاصل زمني لتقليل التكرار المزعج.`);
+    } catch {
+      await bot.sendMessage(chatId, "⚠️ توقف الإرسال عند أول خطأ من واتساب؛ لم أعد إرسال الرسالة تلقائياً.");
+    }
+    return true;
+  }
+
+  if (text === '/groups') {
+    attachConfiguredListeners(userId);
+    const { groupsMenuKeyboardV2 } = await _deps._mod_groups_handler();
+    await bot.sendMessage(chatId, '\u{1F465} \u0625\u062F\u0627\u0631\u0629 \u0627\u0644\u0645\u062C\u0645\u0648\u0639\u0627\u062A', {
+      reply_markup: groupsWebAppMarkup(groupsMenuKeyboardV2(), chatId, userId)
+    });
+    return true;
+  }
+  return false;
+}
+
+export async function handleCallback(bot, query) {
+  const data = query.data || '';
+  const chatId = query.message?.chat.id;
+  const userId = String(query.from.id);
+  attachConfiguredListeners(userId);
+
+  if (data === "menu_groups" || data.startsWith("grpv2_") || data.startsWith("grp_custom_") || data.startsWith("grp_") || data.startsWith("groups_")) {
+    try { await bot.answerCallbackQuery?.(query.id); } catch {}
+  }
+
+  if (data.startsWith("grp_custom_")) {
+    const match = data.match(/^grp_custom_(send|repeat|links|inspect)_(.+)$/);
+    if (!match) return false;
+    const [, action, groupId] = match;
+    if (!groupId.endsWith("@g.us")) {
+      await bot.sendMessage(chatId, "❌ معرّف المجموعة غير صالح.");
+      return true;
+    }
+    const sock = action === "send" || action === "repeat"
+      ? await findSocketForGroup(userId, groupId)
+      : findSocket(userId);
+    if (!sock) {
+      await bot.sendMessage(chatId, action === "send" || action === "repeat"
+        ? "❌ لم أجد اتصال واتساب عضواً في هذه المجموعة."
+        : "❌ اربط واتساب أولاً.");
+      return true;
+    }
+    if (action === "send") {
+      _deps.setState(userId, "awaiting_custom_group_message", { groupId });
+      await bot.sendMessage(chatId, "اكتب الرسالة التي تريد إرسالها للمجموعة:", { reply_markup: _deps.cancelKeyboard?.() });
+      return true;
+    }
+    if (action === "repeat") {
+      _deps.setState(userId, "awaiting_custom_group_repeat_message", { groupId });
+      await bot.sendMessage(chatId, "اكتب الرسالة. بعد ذلك اختر عدد الإرسالات من 1 إلى 5:", { reply_markup: _deps.cancelKeyboard?.() });
+      return true;
+    }
+    const user = _deps.getUser(userId);
+    const key = action === "links" ? "antiLinkGroups" : "inspectInviteGroups";
+    const existing = Array.isArray(user[key]) ? user[key] : [];
+    const enabled = !existing.includes(groupId);
+    const updated = enabled ? [...existing, groupId] : existing.filter((id) => id !== groupId);
+    _deps.saveUser(userId, { [key]: updated });
+    ensureModerationListener(userId, sock);
+    const label = action === "links" ? "حذف الروابط" : "فحص روابط الدعوة";
+    await bot.sendMessage(chatId, `${enabled ? "✅ تم التفعيل" : "⏸️ تم الإيقاف"}: ${label}.\n${action === "links" ? "الحذف يحتاج أن يكون رقم واتساب المرتبط مشرفاً وله صلاحية حذف الرسائل." : "يفحص روابط دعوة واتساب فقط، ولا ينضم إلى المجموعات."}`, {
+      reply_markup: controlsKeyboard(userId, groupId)
+    });
+    return true;
+  }
+
+  if (data === 'menu_groups' || data.startsWith('grpv2_')) {
+    try {
+      await _deps.handleGroupsV2(bot, chatId, userId, data);
+      if (data === "menu_groups") await sendGroupsWebApp(bot, chatId, userId);
+      if (data.startsWith("grpv2_info_")) {
+        const groupId = data.slice("grpv2_info_".length);
+        if (groupId.endsWith("@g.us")) {
+          await bot.sendMessage(chatId, "إجراءات إضافية للمجموعة:", { reply_markup: controlsKeyboard(userId, groupId) });
+        }
+      }
+    } catch (error) {
+      await bot.sendMessage(chatId, `تعذر فتح قسم المجموعات: ${error?.message || 'خطأ غير معروف'}`);
+    }
+    return true;
+  }
+
+  if (data.startsWith('grp_') || data.startsWith('groups_')) {
+    try {
+      const handled = await _deps.handleGroupsCallback(bot, chatId, userId, data);
+      if (!handled) await _deps.handleGroupsV2(bot, chatId, userId, data);
+    } catch (error) {
+      await bot.sendMessage(chatId, `تعذر تنفيذ عملية المجموعات: ${error?.message || 'خطأ غير معروف'}`);
+    }
+    return true;
+  }
+
+  if (
+    data.startsWith('group_') ||
+    data.startsWith('groupinfo_') ||
+    data.startsWith('expfmt_') ||
+    data.startsWith('kickall_confirm_')
+  ) {
+    await _deps.handleGroupsV2(bot, chatId, userId, data);
+    return true;
+  }
+
+  return false;
+}
