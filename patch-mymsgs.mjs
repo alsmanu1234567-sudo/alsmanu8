@@ -37,6 +37,53 @@ function patch(old, newStr, desc) {
   return true;
 }
 
+function removeRetiredMyMsgsHandlers() {
+  const ranges = [
+    ["        // ─── طقس", "        // ─── ترجمة v3"],
+    ["        // ─── أخبار", "        // ─── نكتة"],
+    ["        // ─── حظ اليوم", "        // ─── ويكيبيديا"],
+    ["        // ─── مواقيت الصلاة", "        // ─── تحويل عملة"],
+    ["        // ─── تحويل عملة", "        // ─── ستيكر"],
+  ];
+  let changed = false;
+  for (const [startMarker, endMarker] of ranges) {
+    const start = code.indexOf(startMarker);
+    if (start === -1) continue;
+    if (code.indexOf(startMarker, start + startMarker.length) !== -1) {
+      throw new Error(`توجد أكثر من كتلة مطابقة: ${startMarker}`);
+    }
+    const end = code.indexOf(endMarker, start);
+    if (end === -1) throw new Error(`تعذّر تحديد نهاية الكتلة: ${startMarker}`);
+    code = code.slice(0, start) + code.slice(end);
+    changed = true;
+  }
+
+  const malformedMgArgs = 'replace(/\\s+me$/i, "").replace(//[';
+  if (code.includes(malformedMgArgs)) {
+    code = code.replace(malformedMgArgs, 'replace(/\\s+me$/i, "").replace(/[');
+    changed = true;
+  }
+
+  if (!code.includes('replace(/\\s+me$/i,')) {
+    const withMeSuffix = code.replace(
+      'const _mgArgsClean = _mgArgs.replace(/',
+      'const _mgArgsClean = _mgArgs.replace(/\\s+me$/i, "").replace(/'
+    );
+    if (withMeSuffix !== code) {
+      code = withMeSuffix;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+// This migration runs before the regular guard so it also repairs an already-patched bundle.
+if (removeRetiredMyMsgsHandlers()) {
+  fs.writeFileSync(FILE, code, "utf-8");
+  ok("إزالة الطقس والأخبار والحظ ومواقيت الصلاة وتحويل العملة من معالجات رسائلي");
+  ok("دعم /mg مع رقم الهاتف متبوعاً بـ me");
+}
+
 // ── Guard ──────────────────────────────────────────────────────
 const GUARD = "// PATCH_MYMSGS_APPLIED_v2";
 if (code.includes(GUARD)) {
@@ -266,7 +313,7 @@ const NEW_HANDLERS = `        // PATCH_MYMSGS_APPLIED_v2
       cachePush(cacheKey, msg);
       const senderName = msg.pushName || jid.split("@")[0];`;
 
-patch(ANCHOR, NEW_HANDLERS, "إضافة ميزات: سبام+تاق+طقس+ترجمة+أخبار+نكتة+حظ+ويكيبيديا+صلاة+عملة+ستيكر");
+patch(ANCHOR, NEW_HANDLERS, "إضافة ميزات رسائلي: سبام+تاق+ترجمة+نكتة+ويكيبيديا+ستيكر");
 
 // ══════════════════════════════════════════════════════════════
 // PATCH 2: تحسين /film — عرض العنوان قبل التحميل + بحث مرن
@@ -370,6 +417,10 @@ patch(
 // ══════════════════════════════════════════════════════════════
 // حفظ
 // ══════════════════════════════════════════════════════════════
+if (removeRetiredMyMsgsHandlers()) {
+  ok("تم حذف معالجات الميزات المتقاعدة من الحزمة");
+}
+
 if (patches > 0) {
   fs.writeFileSync(FILE, code, "utf-8");
   console.log("\n" + G + "✅ تم حفظ " + patches + " تعديل على dist/index.mjs" + N + "\n");

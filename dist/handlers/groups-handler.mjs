@@ -1,6 +1,8 @@
 // dist/handlers/groups-handler.mjs
 // Domain: Groups — /groups + callbacks
+import { randomUUID } from "node:crypto";
 import { webappUrlFor } from "../webapp-auth.mjs";
+import { findNextMawdoo3Article } from "../services/groups/mawdoo3-feed-service.mjs";
 
 export const pluginManifest = {
   name: 'groups',
@@ -17,6 +19,13 @@ const _listeners = new WeakSet();
 const _warningTimes = new Map();
 const _inviteCache = new Map();
 let _listenerRecoveryTimer = null;
+let _autoPostTimer = null;
+let _autoPostSweepInFlight = false;
+const _autoPostInFlight = new Set();
+const AUTO_POST_TIME_ZONE = "Africa/Khartoum";
+const MAX_AUTO_POSTS_PER_USER = 40;
+const MAX_AUTO_POST_TIMES = 8;
+const MAX_AUTO_POST_SEEN_URLS_PER_GROUP = 5_000;
 
 export function setDeps(d) {
   _deps = { ...(_deps || {}), ...d };
@@ -24,6 +33,304 @@ export function setDeps(d) {
     _listenerRecoveryTimer = setInterval(recoverGroupListeners, 10_000);
     _listenerRecoveryTimer.unref?.();
     recoverGroupListeners();
+  }
+  if (!_autoPostTimer) {
+    _autoPostTimer = setInterval(runScheduledGroupAutoPosts, 30_000);
+    _autoPostTimer.unref?.();
+  }
+}
+
+function autoPostItems(user) {
+  return Array.isArray(user?.groupAutoPosts) ? user.groupAutoPosts : [];
+}
+
+function publicAutoPost(item) {
+  return {
+    id: String(item.id || ""),
+    topic: String(item.topic || ""),
+    times: Array.isArray(item.times) ? item.times.filter((time) => /^\d{2}:\d{2}$/.test(time)) : [],
+    enabled: item.enabled === true,
+    lastSentAt: item.lastSentAt || null,
+    lastError: item.lastError ? String(item.lastError).slice(0, 220) : null,
+  };
+}
+
+function parseAutoPostTimes(value) {
+  const values = Array.isArray(value)
+    ? value
+    : String(value || "").split(/[,\s،؛]+/);
+  const times = [...new Set(values.map((time) => String(time).trim()).filter(Boolean))];
+  if (!times.length || times.length > MAX_AUTO_POST_TIMES) {
+    throw new Error(`اختر وقتاً واحداً إلى ${MAX_AUTO_POST_TIMES} أوقات لكل إعداد`);
+  }
+  if (times.some((time) => !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(time))) {
+    throw new Error("اكتب الأوقات بصيغة 24 ساعة مثل 08:30 أو 20:15");
+  }
+  return times.sort();
+}
+
+function assertAutoPostAdmin(sock, metadata) {
+  if (ownAccountIsAdmin(sock, metadata) !== true) {
+    throw new Error("إدارة النشر التلقائي متاحة عندما يكون رقم واتساب المرتبط مشرفاً في المجموعة");
+  }
+}
+
+async function getAutoPostGroupAccess(userId, groupId, phoneNumber) {
+  userId = String(userId);
+  groupId = String(groupId || "").trim();
+  if (!groupId.endsWith("@g.us")) throw new Error("معرّف المجموعة غير صالح");
+  if (!phoneNumber) throw new Error("اختر رقم واتساب المرتبط بالمجموعة");
+  const sock = await findSocketForGroup(userId, groupId, phoneNumber);
+  if (!sock) throw new Error("هذه المجموعة غير متاحة على رقم واتساب المختار");
+  const metadata = await sock.groupMetadata(groupId);
+  if (!metadata || (metadata.id && metadata.id !== groupId)) {
+    throw new Error("تعذّر جلب تفاصيل هذه المجموعة");
+  }
+  assertAutoPostAdmin(sock, metadata);
+  return { userId, groupId, phoneNumber: String(phoneNumber), sock, metadata };
+}
+
+function findAutoPost(user, groupId, autoPostId) {
+  return autoPostItems(user).find((item) =>
+    item?.groupId === groupId && String(item.id) === String(autoPostId)
+  );
+}
+
+function seenAutoPostUrls(user, groupId) {
+  const urls = new Set();
+  for (const history of Array.isArray(user?.groupAutoPostHistory) ? user.groupAutoPostHistory : []) {
+    if (history?.groupId !== groupId || !Array.isArray(history.urls)) continue;
+    for (const url of history.urls) urls.add(String(url));
+  }
+  for (const item of autoPostItems(user)) {
+    if (item?.groupId !== groupId || !Array.isArray(item.seenUrls)) continue;
+    for (const url of item.seenUrls) urls.add(String(url));
+  }
+  return [...urls];
+}
+
+function reserveAutoPostUrl(userId, groupId, url) {
+  const user = _deps?.getUser?.(String(userId));
+  if (!user) throw new Error("تعذّر الوصول إلى سجل منع التكرار");
+  const urls = seenAutoPostUrls(user, groupId);
+  if (urls.includes(url)) throw new Error("هذا الرابط سبق نشره في المجموعة");
+  if (urls.length >= MAX_AUTO_POST_SEEN_URLS_PER_GROUP) {
+    throw new Error("وصل سجل منع التكرار إلى الحد الآمن؛ لم يُرسل محتوى جديد");
+  }
+  const histories = Array.isArray(user.groupAutoPostHistory) ? user.groupAutoPostHistory : [];
+  const current = histories.find((entry) => entry?.groupId === groupId);
+  const updatedHistory = current
+    ? histories.map((entry) => entry === current ? { ...entry, urls: [...urls, url] } : entry)
+    : [...histories, { groupId, urls: [...urls, url] }];
+  if (typeof _deps?.saveUser !== "function") throw new Error("تعذّر حفظ سجل منع التكرار");
+  _deps.saveUser(String(userId), { groupAutoPostHistory: updatedHistory });
+}
+
+function saveAutoPostList(userId, items) {
+  if (typeof _deps?.saveUser !== "function") throw new Error("تعذّر حفظ إعدادات النشر التلقائي");
+  _deps.saveUser(String(userId), { groupAutoPosts: items });
+}
+
+function saveAutoPostResult(userId, groupId, autoPostId, patch) {
+  const user = _deps?.getUser?.(String(userId));
+  if (!user) return;
+  const items = autoPostItems(user);
+  const updated = items.map((item) => {
+    if (item?.groupId !== groupId || String(item.id) !== String(autoPostId)) return item;
+    return { ...item, ...patch };
+  });
+  saveAutoPostList(userId, updated);
+}
+
+function postTextForArticle(article) {
+  return `📖 ${article.title}\n${article.url}\nالمصدر: موضوع`;
+}
+
+export function getKhartoumClock(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: AUTO_POST_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return {
+    date: `${values.year}-${values.month}-${values.day}`,
+    time: `${values.hour}:${values.minute}`,
+  };
+}
+
+async function publishScheduledItem(userId, item, day, time) {
+  const groupId = String(item.groupId || "");
+  const lock = `${userId}:${groupId}`;
+  if (_autoPostInFlight.has(lock)) return;
+  _autoPostInFlight.add(lock);
+  try {
+    const user = _deps?.getUser?.(String(userId));
+    const current = findAutoPost(user, groupId, item.id);
+    if (!current?.enabled) return;
+    const attemptDates = {
+      ...(current.attemptDates && typeof current.attemptDates === "object" ? current.attemptDates : {}),
+      [time]: day,
+    };
+    saveAutoPostResult(userId, groupId, item.id, {
+      attemptDates,
+      lastAttemptAt: new Date().toISOString(),
+      lastError: null,
+    });
+
+    const access = await getAutoPostGroupAccess(userId, groupId, current.phoneNumber);
+    const latestUser = _deps?.getUser?.(String(userId)) || user;
+    const article = await findNextMawdoo3Article(current.topic, {
+      seenUrls: seenAutoPostUrls(latestUser, groupId),
+    });
+    reserveAutoPostUrl(userId, groupId, article.url);
+    await access.sock.sendMessage(groupId, { text: postTextForArticle(article) });
+    saveAutoPostResult(userId, groupId, item.id, {
+      lastSentAt: new Date().toISOString(),
+      lastError: null,
+    });
+  } catch (error) {
+    saveAutoPostResult(userId, groupId, item.id, {
+      lastError: String(error?.message || "تعذّر النشر").slice(0, 220),
+      lastFailedAt: new Date().toISOString(),
+    });
+  } finally {
+    _autoPostInFlight.delete(lock);
+  }
+}
+
+export async function runScheduledGroupAutoPosts() {
+  if (_autoPostSweepInFlight || !_deps) return;
+  _autoPostSweepInFlight = true;
+  try {
+    const users = _deps?.inMemoryDB?.users;
+    if (!(users instanceof Map)) return;
+    const now = getKhartoumClock();
+    for (const [userId, user] of users.entries()) {
+      for (const item of autoPostItems(user)) {
+        if (item?.enabled !== true || !String(item.groupId || "").endsWith("@g.us")) continue;
+        const times = Array.isArray(item.times) ? item.times : [];
+        for (const time of times) {
+          if (time !== now.time || item.attemptDates?.[time] === now.date) continue;
+          await publishScheduledItem(String(userId), item, now.date, time);
+        }
+      }
+    }
+  } catch {
+    // A failed user's schedule must not stop the next scheduler sweep.
+  } finally {
+    _autoPostSweepInFlight = false;
+  }
+}
+
+export async function saveWebGroupAutoPost(userId, groupId, phoneNumber, input = {}) {
+  const access = await getAutoPostGroupAccess(userId, groupId, phoneNumber);
+  const user = _deps?.getUser?.(access.userId);
+  if (!user) throw new Error("تعذّر الوصول إلى إعدادات المستخدم");
+  const topic = String(input.topic || "").trim().replace(/\s+/g, " ");
+  if (topic.length < 2 || topic.length > 60) throw new Error("اكتب موضوعاً من حرفين إلى 60 حرفاً");
+  const times = parseAutoPostTimes(input.times);
+  const items = autoPostItems(user);
+  let existing = null;
+  if (input.id) {
+    existing = findAutoPost(user, access.groupId, input.id);
+    if (!existing) throw new Error("إعداد النشر التلقائي غير موجود في هذه المجموعة");
+    if (existing.enabled) {
+      await findNextMawdoo3Article(topic, {
+        seenUrls: seenAutoPostUrls(user, access.groupId),
+      });
+    }
+  } else if (items.length >= MAX_AUTO_POSTS_PER_USER) {
+    throw new Error(`الحد الأقصى ${MAX_AUTO_POSTS_PER_USER} إعداد نشر تلقائي`);
+  }
+  const next = {
+    ...(existing || {}),
+    id: existing?.id || randomUUID(),
+    groupId: access.groupId,
+    phoneNumber: access.phoneNumber,
+    topic,
+    times,
+    enabled: existing?.enabled === true,
+    createdAt: existing?.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  const updated = existing
+    ? items.map((item) => item.id === existing.id ? next : item)
+    : [...items, next];
+  saveAutoPostList(access.userId, updated);
+  return publicAutoPost(next);
+}
+
+export async function setWebGroupAutoPostEnabled(userId, groupId, phoneNumber, autoPostId, enabled) {
+  const access = await getAutoPostGroupAccess(userId, groupId, phoneNumber);
+  if (typeof enabled !== "boolean") throw new Error("حالة النشر غير صالحة");
+  const user = _deps?.getUser?.(access.userId);
+  const item = findAutoPost(user, access.groupId, autoPostId);
+  if (!item) throw new Error("إعداد النشر التلقائي غير موجود");
+  if (enabled) {
+    await findNextMawdoo3Article(item.topic, { seenUrls: seenAutoPostUrls(user, access.groupId) });
+  }
+  const updated = autoPostItems(user).map((entry) =>
+    entry.id === item.id ? { ...entry, enabled, updatedAt: new Date().toISOString(), lastError: null } : entry
+  );
+  saveAutoPostList(access.userId, updated);
+  return publicAutoPost({ ...item, enabled });
+}
+
+export async function deleteWebGroupAutoPost(userId, groupId, phoneNumber, autoPostId) {
+  const access = await getAutoPostGroupAccess(userId, groupId, phoneNumber);
+  const user = _deps?.getUser?.(access.userId);
+  const item = findAutoPost(user, access.groupId, autoPostId);
+  if (!item) throw new Error("إعداد النشر التلقائي غير موجود");
+  saveAutoPostList(access.userId, autoPostItems(user).filter((entry) => entry.id !== item.id));
+  return { ok: true };
+}
+
+export async function previewWebGroupAutoPost(userId, groupId, phoneNumber, autoPostId) {
+  const access = await getAutoPostGroupAccess(userId, groupId, phoneNumber);
+  const user = _deps?.getUser?.(access.userId);
+  const item = findAutoPost(user, access.groupId, autoPostId);
+  if (!item) throw new Error("إعداد النشر التلقائي غير موجود");
+  const article = await findNextMawdoo3Article(item.topic, {
+    seenUrls: seenAutoPostUrls(user, access.groupId),
+  });
+  return article;
+}
+
+export async function publishWebGroupAutoPostNow(userId, groupId, phoneNumber, autoPostId) {
+  const access = await getAutoPostGroupAccess(userId, groupId, phoneNumber);
+  const lock = `${access.userId}:${access.groupId}`;
+  if (_autoPostInFlight.has(lock)) throw new Error("هناك عملية نشر جارية لهذه المجموعة؛ انتظر قليلاً");
+  _autoPostInFlight.add(lock);
+  try {
+    const user = _deps?.getUser?.(access.userId);
+    const item = findAutoPost(user, access.groupId, autoPostId);
+    if (!item) throw new Error("إعداد النشر التلقائي غير موجود");
+    const article = await findNextMawdoo3Article(item.topic, {
+      seenUrls: seenAutoPostUrls(user, access.groupId),
+    });
+    reserveAutoPostUrl(access.userId, access.groupId, article.url);
+    await access.sock.sendMessage(access.groupId, { text: postTextForArticle(article) });
+    saveAutoPostResult(access.userId, access.groupId, item.id, {
+      lastSentAt: new Date().toISOString(),
+      lastError: null,
+    });
+    return { ok: true, title: article.title, url: article.url };
+  } catch (error) {
+    const currentUser = _deps?.getUser?.(access.userId);
+    const currentItem = findAutoPost(currentUser, access.groupId, autoPostId);
+    if (currentItem) {
+      saveAutoPostResult(access.userId, access.groupId, autoPostId, {
+        lastError: String(error?.message || "تعذّر النشر").slice(0, 220),
+      });
+    }
+    throw error;
+  } finally {
+    _autoPostInFlight.delete(lock);
   }
 }
 
@@ -302,6 +609,9 @@ export async function getWebGroupDetails(userId, groupId, phoneNumber) {
     membersTruncated: participants.length > 500,
     antiLinkEnabled: (user.antiLinkGroups || []).includes(groupId),
     inspectInviteEnabled: (user.inspectInviteGroups || []).includes(groupId),
+    autoPosts: autoPostItems(user)
+      .filter((item) => item?.groupId === groupId)
+      .map(publicAutoPost),
   };
 }
 
@@ -405,6 +715,10 @@ function recoverGroupListeners() {
 export function stopModerationListenerRecovery() {
   if (_listenerRecoveryTimer) clearInterval(_listenerRecoveryTimer);
   _listenerRecoveryTimer = null;
+  if (_autoPostTimer) clearInterval(_autoPostTimer);
+  _autoPostTimer = null;
+  _autoPostInFlight.clear();
+  _autoPostSweepInFlight = false;
 }
 
 function controlsKeyboard(userId, groupId) {

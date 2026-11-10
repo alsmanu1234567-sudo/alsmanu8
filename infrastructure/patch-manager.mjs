@@ -26,7 +26,7 @@ const PATCH_REGISTRY = [
   { file: "patch-fixes.mjs",             desc: "إصلاحات cod + تيليجرام" },
   { file: "patch-download.mjs",          desc: "تنزيل vid/song/film/tiktok" },
   { file: "patch-loader.mjs",            desc: "إصلاح ffmpeg + loader.to timeout" },
-  { file: "patch-mymsgs.mjs",            desc: "رسائلي: سبام+طقس+ترجمة+أخبار+نكتة+حظ+ويكي+صلاة+عملة+ستيكر+تاق" },
+  { file: "patch-mymsgs.mjs",            desc: "رسائلي: سبام+ترجمة+نكتة+ويكي+ستيكر+تاق وصيانة الميزات" },
   { file: "patch-video-fix.mjs",         desc: "إصلاح تنزيل vid/song/film: cobalt+timeout+RAM" },
   { file: "patch-dl-v3.mjs",             desc: "إصلاح شامل v3: smartSearch+cobalt-API+y2mate" },
   { file: "patch-film-v4.mjs",           desc: "فيلم v4: downloadMovieSmart+جودات+ضغط تلقائي" },
@@ -136,6 +136,34 @@ export function runAll(baseDir) {
   }
 
   return { applied, skipped, errors, missing };
+}
+
+/**
+ * Apply only explicitly named registered patches.
+ * This keeps maintenance work scoped when unrelated patches have side effects.
+ */
+export function runSelected(baseDir, files) {
+  if (!Array.isArray(files) || files.length === 0) {
+    throw new TypeError("runSelected requires a non-empty list of patch filenames");
+  }
+  const requested = new Set(files);
+  const unknown = files.filter(file => !PATCH_REGISTRY.some(patch => patch.file === file));
+  if (unknown.length) {
+    throw new Error(`Unregistered patch requested: ${unknown.join(", ")}`);
+  }
+
+  section("تطبيق تعديلات محددة");
+  const results = [];
+  for (const patch of PATCH_REGISTRY) {
+    if (requested.has(patch.file)) results.push({ file: patch.file, ...applyOne(baseDir, patch) });
+  }
+
+  return {
+    applied: results.filter(result => result.status === "applied").length,
+    skipped: results.filter(result => result.status === "skipped").length,
+    errors: results.filter(result => result.status === "error").length,
+    results,
+  };
 }
 
 /** قائمة التعديلات المسجّلة (للقراءة فقط) */

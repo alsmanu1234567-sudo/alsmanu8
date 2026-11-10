@@ -21,6 +21,11 @@ import {
   getWebGroupDetails,
   getWebGroupInvite,
   setWebGroupSetting,
+  saveWebGroupAutoPost,
+  setWebGroupAutoPostEnabled,
+  deleteWebGroupAutoPost,
+  previewWebGroupAutoPost,
+  publishWebGroupAutoPostNow,
 } from "./handlers/groups-handler.mjs";
 
 // ─── مصادقة ────────────────────────────────────────────────────────
@@ -111,6 +116,56 @@ export function registerWebApp(app) {
       req.body?.phoneNumber,
       req.body?.action,
       req.body?.value,
+    );
+  }));
+
+  app.post("/api/fw/groups/autopost/save", parseJson, guard(async (uid, req) => {
+    return await saveWebGroupAutoPost(
+      uid,
+      req.body?.id,
+      req.body?.phoneNumber,
+      {
+        id: req.body?.autoPostId,
+        topic: req.body?.topic,
+        times: req.body?.times,
+      },
+    );
+  }));
+
+  app.post("/api/fw/groups/autopost/toggle", parseJson, guard(async (uid, req) => {
+    return await setWebGroupAutoPostEnabled(
+      uid,
+      req.body?.id,
+      req.body?.phoneNumber,
+      req.body?.autoPostId,
+      req.body?.enabled,
+    );
+  }));
+
+  app.post("/api/fw/groups/autopost/delete", parseJson, guard(async (uid, req) => {
+    return await deleteWebGroupAutoPost(
+      uid,
+      req.body?.id,
+      req.body?.phoneNumber,
+      req.body?.autoPostId,
+    );
+  }));
+
+  app.post("/api/fw/groups/autopost/test", parseJson, guard(async (uid, req) => {
+    return await previewWebGroupAutoPost(
+      uid,
+      req.body?.id,
+      req.body?.phoneNumber,
+      req.body?.autoPostId,
+    );
+  }));
+
+  app.post("/api/fw/groups/autopost/publish", parseJson, guard(async (uid, req) => {
+    return await publishWebGroupAutoPostNow(
+      uid,
+      req.body?.id,
+      req.body?.phoneNumber,
+      req.body?.autoPostId,
     );
   }));
 
@@ -238,6 +293,14 @@ body{padding-bottom:88px;font-size:15px;line-height:1.5}
 .group-member-list{max-height:230px;overflow:auto}
 .group-member{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid var(--line);font-size:13px}
 .group-invite-value{font-size:12px;color:var(--mut);overflow-wrap:anywhere;line-height:1.7;margin-top:8px}
+.group-card:hover,.group-card:focus-visible{border-color:var(--acc);outline:none}
+.auto-post-item{background:rgba(10,14,26,.45);border:1px solid var(--line);border-radius:13px;padding:12px;margin-top:9px}
+.auto-post-actions{display:flex;flex-wrap:wrap;gap:7px;margin-top:10px}
+.auto-post-actions .btn{flex:1 1 auto}
+.auto-post-form{margin-top:12px;padding-top:12px;border-top:1px solid var(--line)}
+.auto-post-preview{font-size:12px;line-height:1.8;overflow-wrap:anywhere;margin-top:8px;color:var(--mut)}
+.auto-post-preview a{color:var(--acc);text-decoration:underline}
+.auto-post-error{color:var(--del);font-size:12px;margin-top:6px;overflow-wrap:anywhere}
 </style>
 </head>
 <body>
@@ -496,9 +559,11 @@ async function refreshGroups(btn){
 }
 
 let GROUP_DETAIL = null;
+let AUTO_POST_EDIT_ID = null;
 async function openGroupDetails(groupId){
   const group = ST.groups.find(item=>item.id===groupId);
   if (!group) return toast("❌ المجموعة غير موجودة في قائمتك");
+  AUTO_POST_EDIT_ID = null;
   GROUP_DETAIL = { ...group };
   const sh = document.getElementById("sheet");
   sh.innerHTML = '<div class="grip"></div><div class="empty"><span class="spin"></span><br>جارٍ جلب تفاصيل المجموعة…</div>';
@@ -523,6 +588,8 @@ function renderGroupDetails(){
   const canManage = detail.isAdmin === true;
   const created = detail.createdAt ? new Date(detail.createdAt).toLocaleDateString("ar") : "غير متاح";
   const members = Array.isArray(detail.members) ? detail.members : [];
+  const autoPosts = Array.isArray(detail.autoPosts) ? detail.autoPosts : [];
+  const editingAutoPost = autoPosts.find(item=>item.id===AUTO_POST_EDIT_ID) || null;
   const memberRows = members.length
     ? members.map(member =>
         '<div class="group-member"><span>'+esc(member.label)+'</span><span class="meta">'+esc(member.role)+'</span></div>'
@@ -531,6 +598,27 @@ function renderGroupDetails(){
   const settingRow = (key, label, enabled) =>
     '<div class="group-option"><div><div class="nm">'+label+'</div><div class="meta">'+(enabled?"مفعّل":"متوقف")+'</div></div>' +
     '<button class="btn '+(enabled?"btn-p":"btn-s")+'" data-group-setting="'+key+'" '+(canManage?"":"disabled")+'>'+(enabled?"إيقاف":"تفعيل")+'</button></div>';
+  const autoPostRows = autoPosts.length
+    ? autoPosts.map(item =>
+        '<div class="auto-post-item"><div class="row" style="align-items:flex-start">' +
+        '<div class="grow"><div class="nm">'+esc(item.topic)+'</div>' +
+        '<div class="meta">🕒 '+esc((item.times||[]).join("، "))+' · توقيت الخرطوم</div></div>' +
+        '<span class="badge '+(item.enabled?"on":"off")+'">'+(item.enabled?"مفعّل":"متوقف")+'</span></div>' +
+        (item.lastError?'<div class="auto-post-error">آخر خطأ: '+esc(item.lastError)+'</div>':
+          item.lastSentAt?'<div class="meta" style="white-space:normal;margin-top:5px">آخر نشر: '+esc(new Date(item.lastSentAt).toLocaleString("ar"))+'</div>':
+          '<div class="meta" style="margin-top:5px">لم يُنشر شيء بعد</div>') +
+        '<div class="auto-post-actions">' +
+        '<button class="btn btn-s btn-sm" data-auto-edit="'+esc(item.id)+'" '+(canManage?"":"disabled")+'>تعديل</button>' +
+        '<button class="btn btn-s btn-sm" data-auto-test="'+esc(item.id)+'" '+(canManage?"":"disabled")+'>' +
+        '<span>اختبار الجلب</span></button>' +
+        '<button class="btn btn-p btn-sm" data-auto-publish="'+esc(item.id)+'" '+(canManage?"":"disabled")+'>' +
+        '<span>نشر الآن</span></button>' +
+        '<button class="btn btn-s btn-sm" data-auto-toggle="'+esc(item.id)+'" '+(canManage?"":"disabled")+'>' +
+        (item.enabled?"إيقاف":"تفعيل")+'</button>' +
+        '<button class="btn btn-d btn-sm" data-auto-delete="'+esc(item.id)+'" '+(canManage?"":"disabled")+'>حذف</button>' +
+        '</div><div class="auto-post-preview" data-auto-preview="'+esc(item.id)+'"></div></div>'
+      ).join("")
+    : '<div class="meta" style="white-space:normal">لا توجد جداول نشر لهذه المجموعة بعد.</div>';
 
   sh.innerHTML =
     '<div class="grip"></div>' +
@@ -549,6 +637,22 @@ function renderGroupDetails(){
     settingRow("inspectInvite","فحص روابط دعوة واتساب",detail.inspectInviteEnabled) +
     '<div class="meta" style="white-space:normal;margin-top:8px">'+
     (canManage?"حذف الروابط يتطلب أن يكون رقم واتساب مشرفاً وله صلاحية حذف الرسائل.":"تفعيل إعدادات الحماية متاح عندما يكون رقم واتساب مشرفاً.")+
+    '</div></div>' +
+    '<div class="group-detail-block"><div class="group-detail-title">🗓️ النشر التلقائي</div>' +
+    '<div class="meta" style="white-space:normal">ينشر عنوان المقال ورابطه فقط من قوائم موضوع العامة، ولا ينسخ نص المقال. الأوقات بتوقيت الخرطوم وسجل منع التكرار محفوظ للمجموعة.</div>' +
+    autoPostRows +
+    '<div class="auto-post-form"><div class="fld"><label for="autoPostTopic">نوع المحتوى أو موضوع البحث</label>' +
+    '<input type="text" id="autoPostTopic" list="autoPostTopics" maxlength="60" '+
+    'placeholder="مثال: قصص حب، قصص، نكات أو موضوع آخر" value="'+esc(editingAutoPost?.topic||"")+'" '+(canManage?"":"disabled")+'>' +
+    '<datalist id="autoPostTopics"><option value="قصص حب"><option value="قصص"><option value="نكات"></datalist></div>' +
+    '<div class="fld"><label for="autoPostTimes">مواعيد النشر اليومية</label>' +
+    '<input type="text" id="autoPostTimes" maxlength="63" placeholder="08:30, 20:15" '+
+    'value="'+esc((editingAutoPost?.times||[]).join(", "))+'" '+(canManage?"":"disabled")+'>' +
+    '<div class="meta">أدخل حتى 8 أوقات بصيغة 24 ساعة، مفصولة بفواصل. الإعداد الجديد يبدأ متوقفاً.</div></div>' +
+    '<button class="btn btn-p btn-sm" data-auto-save '+(canManage?"":"disabled")+'>' +
+    (editingAutoPost?"حفظ التعديل":"إضافة جدول نشر")+'</button> '+
+    (editingAutoPost?'<button class="btn btn-s btn-sm" data-auto-cancel-edit>إلغاء التعديل</button>':"")+
+    (!canManage?'<div class="meta" style="white-space:normal;margin-top:8px">تتطلب إدارة النشر التلقائي أن يكون رقم واتساب المرتبط مشرفاً.</div>':"")+
     '</div></div>' +
     '<div class="group-detail-block"><div class="group-detail-title">إدارة المجموعة</div>' +
     '<div style="display:flex;gap:8px;flex-wrap:wrap">' +
@@ -574,6 +678,138 @@ function renderGroupDetails(){
   sh.querySelector("[data-group-invite]")?.addEventListener("click", showGroupInvite);
   sh.querySelector("[data-copy-group-invite]")?.addEventListener("click", copyGroupInvite);
   sh.querySelector("[data-group-message]")?.addEventListener("click", ()=>openGroupMessageSheet(detail.id));
+  sh.querySelector("[data-auto-save]")?.addEventListener("click", saveGroupAutoPost);
+  sh.querySelector("[data-auto-cancel-edit]")?.addEventListener("click", ()=>{
+    AUTO_POST_EDIT_ID = null;
+    renderGroupDetails();
+  });
+  sh.querySelectorAll("[data-auto-edit]").forEach(button=>
+    button.addEventListener("click", ()=>editGroupAutoPost(button.dataset.autoEdit))
+  );
+  sh.querySelectorAll("[data-auto-test]").forEach(button=>
+    button.addEventListener("click", ()=>testGroupAutoPost(button.dataset.autoTest, button))
+  );
+  sh.querySelectorAll("[data-auto-publish]").forEach(button=>
+    button.addEventListener("click", ()=>publishGroupAutoPost(button.dataset.autoPublish, button))
+  );
+  sh.querySelectorAll("[data-auto-toggle]").forEach(button=>
+    button.addEventListener("click", ()=>toggleGroupAutoPost(button.dataset.autoToggle))
+  );
+  sh.querySelectorAll("[data-auto-delete]").forEach(button=>
+    button.addEventListener("click", ()=>deleteGroupAutoPost(button.dataset.autoDelete))
+  );
+}
+
+function editGroupAutoPost(autoPostId){
+  if (!GROUP_DETAIL) return;
+  AUTO_POST_EDIT_ID = autoPostId;
+  renderGroupDetails();
+  document.getElementById("autoPostTopic")?.focus();
+}
+
+async function saveGroupAutoPost(){
+  if (!GROUP_DETAIL) return;
+  const topic = String(document.getElementById("autoPostTopic")?.value||"").trim();
+  const times = String(document.getElementById("autoPostTimes")?.value||"").trim();
+  if (!topic || !times) return toast("⚠️ أدخل نوع المحتوى ومواعيد النشر");
+  const button = document.querySelector("[data-auto-save]");
+  const editing = !!AUTO_POST_EDIT_ID;
+  if (button) { button.disabled = true; button.textContent = "جارٍ الحفظ…"; }
+  try {
+    await api("/api/fw/groups/autopost/save", {
+      id: GROUP_DETAIL.id,
+      phoneNumber: GROUP_DETAIL.phoneNumber || "",
+      autoPostId: AUTO_POST_EDIT_ID,
+      topic,
+      times
+    });
+    AUTO_POST_EDIT_ID = null;
+    toast(editing?"✅ تم تحديث الجدول":"✅ تمت إضافة الجدول وهو متوقف");
+    await openGroupDetails(GROUP_DETAIL.id);
+  } catch(e) {
+    toast("❌ "+e.message);
+    if (button) { button.disabled = false; button.textContent = editing?"حفظ التعديل":"إضافة جدول نشر"; }
+  }
+}
+
+async function toggleGroupAutoPost(autoPostId){
+  if (!GROUP_DETAIL) return;
+  const item = (GROUP_DETAIL.autoPosts||[]).find(entry=>entry.id===autoPostId);
+  if (!item) return toast("❌ إعداد النشر غير موجود");
+  const enabled = !item.enabled;
+  if (!confirm(enabled
+    ? "سيُنشر عنوان ورابط من موضوع في الأوقات المحددة. هل تريد التفعيل؟"
+    : "إيقاف النشر التلقائي لهذا الجدول؟")) return;
+  try {
+    await api("/api/fw/groups/autopost/toggle", {
+      id: GROUP_DETAIL.id,
+      phoneNumber: GROUP_DETAIL.phoneNumber || "",
+      autoPostId,
+      enabled
+    });
+    toast(enabled?"✅ تم تفعيل الجدول":"⏸️ تم إيقاف الجدول");
+    await openGroupDetails(GROUP_DETAIL.id);
+  } catch(e) { toast("❌ "+e.message); }
+}
+
+async function testGroupAutoPost(autoPostId, button){
+  if (!GROUP_DETAIL) return;
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = "جارٍ اختبار المصدر…";
+  const preview = Array.from(document.querySelectorAll("[data-auto-preview]"))
+    .find(element=>element.dataset.autoPreview===autoPostId);
+  if (preview) preview.textContent = "جارٍ جلب عنوان ورابط من موضوع…";
+  try {
+    const item = await api("/api/fw/groups/autopost/test", {
+      id: GROUP_DETAIL.id,
+      phoneNumber: GROUP_DETAIL.phoneNumber || "",
+      autoPostId
+    });
+    if (preview) preview.innerHTML = '<div>'+esc(item.title)+'</div><a href="'+esc(item.url)+'" target="_blank" rel="noopener noreferrer">فتح المصدر في موضوع</a>';
+    toast("✅ نجح اختبار الجلب؛ لم تُرسل رسالة للمجموعة");
+  } catch(e) {
+    if (preview) preview.innerHTML = '<div class="auto-post-error">'+esc(e.message)+'</div>';
+    toast("❌ "+e.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
+}
+
+async function publishGroupAutoPost(autoPostId, button){
+  if (!GROUP_DETAIL) return;
+  if (!confirm("سيتم نشر عنوان ورابط واحد الآن في المجموعة. هل تريد المتابعة؟")) return;
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = "جارٍ النشر…";
+  try {
+    const result = await api("/api/fw/groups/autopost/publish", {
+      id: GROUP_DETAIL.id,
+      phoneNumber: GROUP_DETAIL.phoneNumber || "",
+      autoPostId
+    });
+    toast("✅ تم نشر العنوان والرابط");
+    await openGroupDetails(GROUP_DETAIL.id);
+  } catch(e) {
+    toast("❌ "+e.message);
+    button.disabled = false;
+    button.textContent = original;
+  }
+}
+
+async function deleteGroupAutoPost(autoPostId){
+  if (!GROUP_DETAIL || !confirm("حذف هذا الجدول؟ سيبقى سجل الروابط محفوظاً لمنع تكرارها.")) return;
+  try {
+    await api("/api/fw/groups/autopost/delete", {
+      id: GROUP_DETAIL.id,
+      phoneNumber: GROUP_DETAIL.phoneNumber || "",
+      autoPostId
+    });
+    if (AUTO_POST_EDIT_ID === autoPostId) AUTO_POST_EDIT_ID = null;
+    toast("🗑 تم حذف الجدول");
+    await openGroupDetails(GROUP_DETAIL.id);
+  } catch(e) { toast("❌ "+e.message); }
 }
 
 async function toggleGroupSetting(setting){

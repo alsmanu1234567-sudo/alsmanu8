@@ -9,8 +9,25 @@ import { fileURLToPath } from "url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DIST = join(__dirname, "dist/index.mjs");
 const GUARD = "PATCH_TRANSLATE_V3_APPLIED";
+const IN_PLACE_GUARD = "PATCH_TRANSLATE_EDIT_IN_PLACE_V1";
 
 let c = readFileSync(DIST, "utf8");
+if (c.includes(GUARD) && !c.includes(IN_PLACE_GUARD)) {
+  const primaryOld = "await activeSock.sendMessage(jid, { text: prefix + translated });";
+  const fallbackPattern = /await activeSock\.sendMessage\(jid, \{ text: [^\n]*\+ fbOut \}\);/g;
+  const fallbackMatches = c.match(fallbackPattern) || [];
+  if (!c.includes(primaryOld) || fallbackMatches.length !== 1) {
+    throw new Error("تعذّر تحديد مساري نجاح الترجمة الحاليين بأمان");
+  }
+  c = c.replace(
+    primaryOld,
+    `if (!msg?.key?.id || msg.key.fromMe !== true) throw new Error("لا يمكن تعديل رسالة لم يرسلها الحساب المرتبط");
+              await activeSock.sendMessage(jid, { text: translated, edit: msg.key }); // ${IN_PLACE_GUARD}`
+  );
+  c = c.replace(fallbackPattern, "await activeSock.sendMessage(jid, { text: fbOut, edit: msg.key });");
+  writeFileSync(DIST, c, "utf8");
+  console.log("✅ باتش (2 تعديل): استبدال رسالة أمر الترجمة نفسها في المسارين الأساسي والاحتياطي");
+}
 if (c.includes(GUARD)) { console.log("ℹ️  باتش (مطبّق سابقاً): تحسين الترجمة v3"); process.exit(0); }
 
 // الكود القديم
@@ -85,10 +102,8 @@ const NEW = `        // ─── ترجمة v3 (Google Translate) ── ${GUAR
               const { translated, detectedLang } = await _googleTranslate(trText, trLang);
               if (!translated) throw new Error("no result");
 
-              const langLabels = { ar: "🇸🇦 عربي", en: "🇺🇸 إنجليزي", fr: "🇫🇷 فرنسي", de: "🇩🇪 ألماني", tr: "🇹🇷 تركي", ru: "🇷🇺 روسي", zh: "🇨🇳 صيني", es: "🇪🇸 إسباني", it: "🇮🇹 إيطالي", ja: "🇯🇵 ياباني", ko: "🇰🇷 كوري", fa: "🇮🇷 فارسي", ur: "🇵🇰 أردو", hi: "🇮🇳 هندي" };
-              const toLbl = langLabels[trLang] || trLang;
-              const prefix = isQuotedTr ? "🌐 *ترجمة رسالة الشخص إلى " + toLbl + ":*\\n\\n" : "🌐 *الترجمة إلى " + toLbl + ":*\\n\\n";
-              await activeSock.sendMessage(jid, { text: prefix + translated });
+              if (!msg?.key?.id || msg.key.fromMe !== true) throw new Error("لا يمكن تعديل رسالة لم يرسلها الحساب المرتبط");
+              await activeSock.sendMessage(jid, { text: translated, edit: msg.key }); // ${IN_PLACE_GUARD}
             } catch {
               // fallback: MyMemory بلغة مباشرة
               try {
@@ -97,7 +112,7 @@ const NEW = `        // ─── ترجمة v3 (Google Translate) ── ${GUAR
                 const fbD = await fbR.json();
                 const fbOut = fbD.responseData?.translatedText;
                 if (fbOut && !fbOut.includes("INVALID SOURCE LANGUAGE")) {
-                  await activeSock.sendMessage(jid, { text: "🌐 *الترجمة:*\\n\\n" + fbOut });
+                  await activeSock.sendMessage(jid, { text: fbOut, edit: msg.key });
                 } else throw new Error("fallback failed");
               } catch {
                 try { await activeSock.sendMessage(jid, { text: "❌ تعذّر الترجمة — تأكد من الاتصال بالإنترنت" }); } catch {}
